@@ -29,8 +29,8 @@ public class LetterboxdApi
     private readonly HttpClient client;
 
     private static readonly Uri BaseUri = new Uri("https://letterboxd.com/");
-    private static readonly Uri ApiLogEntriesUri = new Uri("https://api.letterboxd.com/api/v0/production-log-entries");
-    private static readonly Uri ApiFallbackLogEntriesUri = new Uri("https://api.letterboxd.com/api/v0/log-entries");
+    private static readonly Uri ApiLogEntriesUri = new Uri("https://letterboxd.com/api/v0/production-log-entries");
+    private static readonly Uri ApiFallbackLogEntriesUri = new Uri("https://letterboxd.com/api/v0/log-entries");
     private static readonly JsonSerializerOptions ApiJsonSerializerOptions = new JsonSerializerOptions
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -152,6 +152,42 @@ public class LetterboxdApi
         this.csrf = token;
     }
 
+    private async Task RefreshPageCsrfAsync(string path, string? referrer = null)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, path);
+        SetNavigationHeaders(request.Headers, "same-origin", referrer);
+        using var response = await client.SendAsync(request).ConfigureAwait(false);
+        var html = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var bodyPreview = html.Length > 300 ? html.Substring(0, 300) : html;
+            throw new Exception(
+                $"Letterboxd returned {(int)response.StatusCode} while refreshing CSRF from {path}. Body: {bodyPreview}");
+        }
+
+        var pageCsrf = ExtractSupermodelCsrf(html);
+        if (string.IsNullOrWhiteSpace(pageCsrf))
+        {
+            pageCsrf = ExtractHiddenInput(html, "__csrf");
+        }
+
+        if (!string.IsNullOrWhiteSpace(pageCsrf))
+        {
+            this.csrf = pageCsrf;
+            return;
+        }
+
+        var cookieCsrf = GetCsrfFromCookie();
+        if (!string.IsNullOrWhiteSpace(cookieCsrf))
+        {
+            this.csrf = cookieCsrf;
+            return;
+        }
+
+        throw new Exception($"Could not resolve CSRF token from {path}.");
+    }
+
     private async Task<bool> IsLoggedInAsync()
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, "/");
@@ -252,7 +288,7 @@ public class LetterboxdApi
         {
             try
             {
-                await RefreshCsrfCookieAsync().ConfigureAwait(false);
+                await RefreshPageCsrfAsync("/").ConfigureAwait(false);
                 return;
             }
             catch
@@ -395,25 +431,8 @@ public class LetterboxdApi
             }
         }
 
-        // 3) Refresh CSRF cookie after login
-        await RefreshCsrfCookieAsync().ConfigureAwait(false);
-
-        // 4) Refresh CSRF after login (best-effort)
-        // Some sites rotate CSRF tokens; we try to extract it from the homepage.
-        try
-        {
-            using var homeRequest = new HttpRequestMessage(HttpMethod.Get, "/");
-            SetNavigationHeaders(homeRequest.Headers, "same-origin", "https://letterboxd.com/sign-in/");
-            using var homeResponse = await client.SendAsync(homeRequest).ConfigureAwait(false);
-            var homeHtml = await homeResponse.Content.ReadAsStringAsync().ConfigureAwait(false);
-            var csrfAfter = ExtractHiddenInput(homeHtml, "__csrf");
-            if (!string.IsNullOrWhiteSpace(csrfAfter))
-                this.csrf = csrfAfter;
-        }
-        catch
-        {
-            // Keep the sign-in csrf if this fails.
-        }
+        // 3) Refresh page-scoped CSRF after login.
+        await RefreshPageCsrfAsync("/", "https://letterboxd.com/sign-in/").ConfigureAwait(false);
     }
 
     public async Task<FilmResult> SearchFilmByTmdbId(int tmdbid)
@@ -508,7 +527,7 @@ public class LetterboxdApi
     }
 
 
-    public async Task MarkAsWatched(string filmSlug, string productionId, DateTime? date, string[] tags, bool liked = false)
+    public async Task MarkAsWatched(string filmSlug, string productionId, string filmId, DateTime? date, string[] tags, bool liked = false)
     {
         if (string.IsNullOrWhiteSpace(productionId))
         {
@@ -517,30 +536,50 @@ public class LetterboxdApi
 
         for (int attempt = 0; attempt < 3; attempt++)
         {
-            await RefreshCsrfCookieAsync().ConfigureAwait(false);
+            await RefreshPageCsrfAsync($"/film/{filmSlug}/").ConfigureAwait(false);
             var requestBody = BuildCreateLogEntryRequest(productionId, date, tags, liked);
             var requestJson = JsonSerializer.Serialize(requestBody, ApiJsonSerializerOptions);
 
             var submission = await SubmitLogEntryAsync(ApiLogEntriesUri, filmSlug, requestJson).ConfigureAwait(false);
             if (submission.StatusCode == HttpStatusCode.NotFound)
             {
-                var fallbackRequestBody = BuildFallbackCreateLogEntryRequest(productionId, date, tags, liked);
+                if (string.IsNullOrWhiteSpace(filmId))
+                {
+                    throw new Exception($"Could not resolve filmId for /film/{filmSlug}/ fallback submission.");
+                }
+
+                var fallbackRequestBody = BuildFallbackCreateLogEntryRequest(filmId, date, tags, liked);
                 var fallbackRequestJson = JsonSerializer.Serialize(fallbackRequestBody, ApiJsonSerializerOptions);
                 submission = await SubmitLogEntryAsync(ApiFallbackLogEntriesUri, filmSlug, fallbackRequestJson)
                     .ConfigureAwait(false);
             }
 
             var bodyPreview = submission.Body.Length > 300 ? submission.Body.Substring(0, 300) : submission.Body;
+            if ((int)submission.StatusCode >= 200 && (int)submission.StatusCode < 300)
+            {
+                return;
+            }
+
+            if (submission.StatusCode == HttpStatusCode.Forbidden &&
+                bodyPreview.Contains("Invalid CSRF token", StringComparison.OrdinalIgnoreCase) &&
+                attempt < 2)
+            {
+                var delayMs = (attempt + 1) * 1500 + Random.Shared.Next(1000);
+                _logger?.LogWarning(
+                    "Letterboxd rejected the diary submission CSRF token for film {FilmSlug} on attempt {Attempt}. Retrying in {Delay}ms...",
+                    filmSlug,
+                    attempt + 1,
+                    delayMs);
+                await Task.Delay(delayMs).ConfigureAwait(false);
+                continue;
+            }
+
             if (submission.StatusCode == HttpStatusCode.Forbidden)
             {
                 throw new Exception(
                     "Letterboxd returned 403 during diary submission via API. This is likely an authentication or anti-bot failure. " +
                     "Body: " + bodyPreview
                 );
-            }
-            if (submission.StatusCode == HttpStatusCode.OK)
-            {
-                return;
             }
 
             var apiMessage = TryExtractApiMessage(submission.Body);
@@ -853,14 +892,14 @@ public class LetterboxdApi
     }
 
     internal static FallbackCreateLogEntryRequest BuildFallbackCreateLogEntryRequest(
-        string productionId,
+        string filmId,
         DateTime? date,
         IEnumerable<string>? tags,
         bool liked)
     {
         return new FallbackCreateLogEntryRequest
         {
-            FilmId = productionId,
+            FilmId = filmId,
             DiaryDetails = date.HasValue
                 ? new DiaryDetailsRequest(
                     date.Value.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
@@ -930,11 +969,15 @@ public class LetterboxdApi
         request.Headers.TryAddWithoutValidation("Origin", "https://letterboxd.com");
         request.Headers.TryAddWithoutValidation("sec-fetch-dest", "empty");
         request.Headers.TryAddWithoutValidation("sec-fetch-mode", "cors");
-        request.Headers.TryAddWithoutValidation("sec-fetch-site", "same-site");
+        request.Headers.TryAddWithoutValidation("sec-fetch-site", "same-origin");
         request.Headers.Remove("sec-fetch-user");
         request.Headers.Remove("upgrade-insecure-requests");
         request.Headers.Accept.Clear();
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        if (!string.IsNullOrWhiteSpace(this.csrf))
+        {
+            request.Headers.TryAddWithoutValidation("X-CSRF-TOKEN", this.csrf);
+        }
         request.Content = new StringContent(requestJson, Encoding.UTF8, "application/json");
 
         using var response = await client.SendAsync(request).ConfigureAwait(false);
