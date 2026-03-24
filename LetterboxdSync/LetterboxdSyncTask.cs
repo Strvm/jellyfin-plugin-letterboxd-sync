@@ -128,7 +128,7 @@ public class LetterboxdSyncTask : IScheduledTask
                         }
                         else
                         {
-                            await api.MarkAsWatched(filmResult.filmSlug, filmResult.filmId, viewingDate, tags, favorite).ConfigureAwait(false);
+                            await api.MarkAsWatched(filmResult.filmSlug, filmResult.productionId, viewingDate, tags, favorite).ConfigureAwait(false);
                             _logger.LogInformation(
                                 @"Film logged in Letterboxd
                                 User: {Username} ({UserId})

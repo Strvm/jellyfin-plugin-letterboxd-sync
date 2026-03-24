@@ -7,6 +7,7 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using HtmlAgilityPack;
@@ -28,7 +29,52 @@ public class LetterboxdApi
     private readonly HttpClient client;
 
     private static readonly Uri BaseUri = new Uri("https://letterboxd.com/");
-    internal sealed record DiaryEntryFormDetails(string ActionPath, string ViewingableUid);
+    private static readonly Uri ApiLogEntriesUri = new Uri("https://api.letterboxd.com/api/v0/production-log-entries");
+    private static readonly Uri ApiFallbackLogEntriesUri = new Uri("https://api.letterboxd.com/api/v0/log-entries");
+    private static readonly JsonSerializerOptions ApiJsonSerializerOptions = new JsonSerializerOptions
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+    };
+
+    internal sealed record DiaryDetailsRequest(string DiaryDate, bool Rewatch);
+    internal sealed record ReviewDetailsRequest(string Text, bool ContainsSpoilers);
+    internal sealed class CreateLogEntryRequest
+    {
+        public string ProductionId { get; init; } = string.Empty;
+
+        public DiaryDetailsRequest? DiaryDetails { get; init; }
+
+        public ReviewDetailsRequest? Review { get; init; }
+
+        public string[] Tags { get; init; } = [];
+
+        public double? Rating { get; init; }
+
+        public bool Like { get; init; }
+
+        public string? PrivacyPolicy { get; init; }
+    }
+
+    internal sealed class FallbackCreateLogEntryRequest
+    {
+        public string FilmId { get; init; } = string.Empty;
+
+        public DiaryDetailsRequest? DiaryDetails { get; init; }
+
+        public ReviewDetailsRequest? Review { get; init; }
+
+        public string[] Tags { get; init; } = [];
+
+        public double? Rating { get; init; }
+
+        public bool Like { get; init; }
+
+        public string? PrivacyPolicy { get; init; }
+    }
+
+    private sealed record ApiSubmissionResponse(HttpStatusCode StatusCode, string Body, string EndpointPath);
+    internal sealed record ProductionIdentifier(string Lid, string Uid);
 
     private bool HasCookie(string name)
     {
@@ -125,33 +171,6 @@ public class LetterboxdApi
         }
 
         return IsLoggedInHtml(html);
-    }
-
-    private async Task<DiaryEntryFormDetails> GetDiaryEntryFormDetailsAsync(string filmSlug, string filmId)
-    {
-        using var request = new HttpRequestMessage(HttpMethod.Get, $"/film/{filmSlug}/");
-        SetNavigationHeaders(request.Headers, "same-origin");
-        using var response = await client.SendAsync(request).ConfigureAwait(false);
-        if (!response.IsSuccessStatusCode)
-        {
-            var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-            if (body.Length > 300)
-            {
-                body = body.Substring(0, 300);
-            }
-
-            throw new Exception(
-                $"Film page lookup returned {(int)response.StatusCode} for https://letterboxd.com/film/{filmSlug}/. Body: " + body);
-        }
-
-        var html = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-        var pageCsrf = ExtractSupermodelCsrf(html);
-        if (!string.IsNullOrWhiteSpace(pageCsrf))
-        {
-            this.csrf = pageCsrf;
-        }
-
-        return ParseDiaryEntryForm(html, filmSlug, filmId);
     }
 
     public LetterboxdApi(ILogger? logger = null)
@@ -481,22 +500,7 @@ public class LetterboxdApi
                         }
 
                         var filmHtml = await filmRes.Content.ReadAsStringAsync().ConfigureAwait(false);
-                        var filmDoc = new HtmlDocument();
-                        filmDoc.LoadHtml(filmHtml);
-
-                        HtmlNode? elForId =
-                            filmDoc.DocumentNode.SelectSingleNode($"//div[@data-film-slug='{filmSlug}']") ??
-                            filmDoc.DocumentNode.SelectSingleNode($"//div[@data-item-link='/film/{filmSlug}/']") ??
-                            filmDoc.DocumentNode.SelectSingleNode("//div[@data-film-id]");
-
-                        if (elForId == null)
-                            throw new Exception("The search returned no results (No html element found to get letterboxd filmId)");
-
-                        string filmId = elForId.GetAttributeValue("data-film-id", string.Empty);
-                        if (string.IsNullOrEmpty(filmId))
-                            throw new Exception("The search returned no results (data-film-id attribute is empty)");
-
-                        return new FilmResult(filmSlug, filmId);
+                        return ParseFilmResult(filmHtml, filmSlug, filmRes.Headers);
                     }
                 }
             }
@@ -504,80 +508,61 @@ public class LetterboxdApi
     }
 
 
-    public async Task MarkAsWatched(string filmSlug, string filmId, DateTime? date, string[] tags, bool liked = false)
+    public async Task MarkAsWatched(string filmSlug, string productionId, DateTime? date, string[] tags, bool liked = false)
     {
+        if (string.IsNullOrWhiteSpace(productionId))
+        {
+            throw new Exception($"Could not resolve productionId for /film/{filmSlug}/.");
+        }
+
         for (int attempt = 0; attempt < 3; attempt++)
         {
             await RefreshCsrfCookieAsync().ConfigureAwait(false);
-            var diaryEntryForm = await GetDiaryEntryFormDetailsAsync(filmSlug, filmId).ConfigureAwait(false);
+            var requestBody = BuildCreateLogEntryRequest(productionId, date, tags, liked);
+            var requestJson = JsonSerializer.Serialize(requestBody, ApiJsonSerializerOptions);
 
-            using (var request = new HttpRequestMessage(HttpMethod.Post, diaryEntryForm.ActionPath))
+            var submission = await SubmitLogEntryAsync(ApiLogEntriesUri, filmSlug, requestJson).ConfigureAwait(false);
+            if (submission.StatusCode == HttpStatusCode.NotFound)
             {
-                // Make the request look like the browser flow for this action
-                request.Headers.Referrer = new Uri($"https://letterboxd.com/film/{filmSlug}/");
-                request.Headers.TryAddWithoutValidation("Origin", "https://letterboxd.com");
-                request.Headers.TryAddWithoutValidation("X-Requested-With", "XMLHttpRequest");
-                request.Headers.TryAddWithoutValidation("sec-fetch-dest", "empty");
-                request.Headers.TryAddWithoutValidation("sec-fetch-mode", "cors");
-                request.Headers.TryAddWithoutValidation("sec-fetch-site", "same-origin");
-                request.Headers.Remove("sec-fetch-user");
-                request.Headers.Remove("upgrade-insecure-requests");
-                request.Headers.Accept.Clear();
-                request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-                request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/javascript"));
-                request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("*/*", 0.01));
-
-                request.Content = new FormUrlEncodedContent(
-                    BuildDiaryEntryRequestForm(this.csrf, diaryEntryForm, date, tags, liked));
-
-                using (var response = await client.SendAsync(request).ConfigureAwait(false))
-                {
-                    var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-                    var bodyPreview = body.Length > 300 ? body.Substring(0, 300) : body;
-                    if (response.StatusCode == HttpStatusCode.Forbidden)
-                    {
-                        throw new Exception(
-                            "Letterboxd returned 403 during diary submission. This is likely reCAPTCHA/anti-bot enforcement. " +
-                            "Body: " + bodyPreview
-                        );
-                    }
-                    if (response.StatusCode != HttpStatusCode.OK)
-                    {
-                        throw new Exception(
-                            $"Letterboxd returned {(int)response.StatusCode} from {diaryEntryForm.ActionPath}. Body: " + bodyPreview);
-                    }
-
-                    using (JsonDocument doc = JsonDocument.Parse(body))
-                    {
-                        var json = doc.RootElement;
-
-                        // If response includes rotated CSRF, keep it
-                        if (json.TryGetProperty("csrf", out var csrfEl) && csrfEl.ValueKind == JsonValueKind.String)
-                        {
-                            var newCsrf = csrfEl.GetString();
-                            if (!string.IsNullOrWhiteSpace(newCsrf))
-                                this.csrf = newCsrf!;
-                        }
-
-                        if (SuccessOperation(json, out string message))
-                            return;
-
-                        // Retry on transient errors (expired CSRF, rate-limiting)
-                        if (attempt < 2 &&
-                            (message.Contains("expired", StringComparison.OrdinalIgnoreCase) ||
-                             message.Contains("try again", StringComparison.OrdinalIgnoreCase)))
-                        {
-                            var delayMs = (attempt + 1) * 5000 + Random.Shared.Next(3000);
-                            _logger?.LogWarning("Transient error on attempt {Attempt} for film {FilmSlug}: \"{Message}\". Retrying in {Delay}ms...",
-                                attempt + 1, filmSlug, message, delayMs);
-                            await Task.Delay(delayMs).ConfigureAwait(false);
-                            continue;
-                        }
-
-                        throw new Exception(message);
-                    }
-                }
+                var fallbackRequestBody = BuildFallbackCreateLogEntryRequest(productionId, date, tags, liked);
+                var fallbackRequestJson = JsonSerializer.Serialize(fallbackRequestBody, ApiJsonSerializerOptions);
+                submission = await SubmitLogEntryAsync(ApiFallbackLogEntriesUri, filmSlug, fallbackRequestJson)
+                    .ConfigureAwait(false);
             }
+
+            var bodyPreview = submission.Body.Length > 300 ? submission.Body.Substring(0, 300) : submission.Body;
+            if (submission.StatusCode == HttpStatusCode.Forbidden)
+            {
+                throw new Exception(
+                    "Letterboxd returned 403 during diary submission via API. This is likely an authentication or anti-bot failure. " +
+                    "Body: " + bodyPreview
+                );
+            }
+            if (submission.StatusCode == HttpStatusCode.OK)
+            {
+                return;
+            }
+
+            var apiMessage = TryExtractApiMessage(submission.Body);
+            if (attempt < 2 &&
+                (submission.StatusCode == HttpStatusCode.TooManyRequests ||
+                 (int)submission.StatusCode >= 500 ||
+                 apiMessage.Contains("try again", StringComparison.OrdinalIgnoreCase)))
+            {
+                var delayMs = (attempt + 1) * 5000 + Random.Shared.Next(3000);
+                _logger?.LogWarning(
+                    "Transient error on attempt {Attempt} for film {FilmSlug}: \"{Message}\". Retrying in {Delay}ms...",
+                    attempt + 1,
+                    filmSlug,
+                    apiMessage,
+                    delayMs);
+                await Task.Delay(delayMs).ConfigureAwait(false);
+                continue;
+            }
+
+            throw new Exception(
+                $"Letterboxd returned {(int)submission.StatusCode} from {submission.EndpointPath}. " +
+                $"Message: {apiMessage}. Body: {bodyPreview}");
         }
 
         throw new Exception("Failed to submit diary entry after retries.");
@@ -625,34 +610,6 @@ public class LetterboxdApi
         }
 
         return lstDates.Count > 0 ? lstDates.Max() : null;
-    }
-
-    private bool SuccessOperation(JsonElement json, out string message)
-    {
-        message = string.Empty;
-
-        if (json.TryGetProperty("messages", out JsonElement messagesElement))
-        {
-            StringBuilder errorMessages = new StringBuilder();
-            foreach (var i in messagesElement.EnumerateArray())
-                errorMessages.Append(i.GetString());
-            message = errorMessages.ToString();
-        }
-
-        if (json.TryGetProperty("result", out JsonElement statusElement))
-        {
-            switch (statusElement.ValueKind)
-            {
-                case JsonValueKind.String:
-                    return statusElement.GetString() == "error" ? false : true;
-                case JsonValueKind.True:
-                    return true;
-                case JsonValueKind.False:
-                    return false;
-            }
-        }
-
-        return false;
     }
 
     /// <summary>
@@ -811,62 +768,107 @@ public class LetterboxdApi
         return m.Success ? WebUtility.HtmlDecode(m.Groups[1].Value) : null;
     }
 
-    internal static DiaryEntryFormDetails ParseDiaryEntryForm(string html, string filmSlug, string filmId)
+    internal static FilmResult ParseFilmResult(
+        string html,
+        string filmSlug,
+        HttpResponseHeaders? headers = null)
     {
         var htmlDoc = new HtmlDocument();
         htmlDoc.LoadHtml(html);
 
-        var form = htmlDoc.DocumentNode.SelectSingleNode(
-                       "//form[contains(concat(' ', normalize-space(@class), ' '), ' js-diary-entry-form ')]") ??
-                   htmlDoc.DocumentNode.SelectSingleNode("//form[starts-with(@id, 'diary-entry-form-')]");
+        HtmlNode? filmNode =
+            htmlDoc.DocumentNode.SelectSingleNode(
+                $"//*[@data-item-slug='{filmSlug}' and @data-film-id and @data-postered-identifier]") ??
+            htmlDoc.DocumentNode.SelectSingleNode(
+                $"//*[@data-item-link='/film/{filmSlug}/' and @data-film-id and @data-postered-identifier]") ??
+            htmlDoc.DocumentNode.SelectSingleNode("//*[@data-film-id and @data-postered-identifier]");
 
-        var actionPath = NormalizeActionPath(form?.GetAttributeValue("action", string.Empty));
-        var viewingableUid = form?.SelectSingleNode(".//input[@name='viewingableUid']")
-            ?.GetAttributeValue("value", string.Empty) ?? string.Empty;
-
-        if (string.IsNullOrWhiteSpace(viewingableUid) && !string.IsNullOrWhiteSpace(filmId))
+        if (filmNode == null)
         {
-            viewingableUid = $"film:{filmId}";
+            throw new Exception("The search returned no results (No html element found to get Letterboxd film identifiers)");
         }
 
-        if (string.IsNullOrWhiteSpace(viewingableUid))
+        var postedIdentifier = ParseProductionIdentifier(
+            filmNode.GetAttributeValue("data-postered-identifier", string.Empty),
+            filmSlug);
+
+        var filmId = filmNode.GetAttributeValue("data-film-id", string.Empty);
+        if (string.IsNullOrWhiteSpace(filmId) &&
+            postedIdentifier.Uid.StartsWith("film:", StringComparison.OrdinalIgnoreCase))
         {
-            throw new Exception($"Could not resolve viewingableUid from /film/{filmSlug}/ diary form.");
+            filmId = postedIdentifier.Uid["film:".Length..];
         }
 
-        return new DiaryEntryFormDetails(actionPath, viewingableUid);
+        if (string.IsNullOrWhiteSpace(filmId))
+        {
+            throw new Exception("The search returned no results (data-film-id attribute is empty)");
+        }
+
+        var productionId = TryGetProductionIdFromHeaders(headers) ?? postedIdentifier.Lid;
+        if (string.IsNullOrWhiteSpace(productionId))
+        {
+            throw new Exception($"Could not resolve Letterboxd productionId from /film/{filmSlug}/.");
+        }
+
+        return new FilmResult(filmSlug, filmId, productionId);
     }
 
-    internal static IReadOnlyList<KeyValuePair<string, string>> BuildDiaryEntryRequestForm(
-        string csrf,
-        DiaryEntryFormDetails diaryEntryForm,
+    internal static ProductionIdentifier ParseProductionIdentifier(string rawIdentifier, string filmSlug)
+    {
+        if (string.IsNullOrWhiteSpace(rawIdentifier))
+        {
+            throw new Exception($"Could not resolve posted identifier from /film/{filmSlug}/.");
+        }
+
+        using var document = JsonDocument.Parse(WebUtility.HtmlDecode(rawIdentifier));
+        var root = document.RootElement;
+        var lid = root.TryGetProperty("lid", out var lidElement) ? lidElement.GetString() : null;
+        var uid = root.TryGetProperty("uid", out var uidElement) ? uidElement.GetString() : null;
+
+        if (string.IsNullOrWhiteSpace(lid) || string.IsNullOrWhiteSpace(uid))
+        {
+            throw new Exception($"Could not resolve productionId from /film/{filmSlug}/.");
+        }
+
+        return new ProductionIdentifier(lid!, uid!);
+    }
+
+    internal static CreateLogEntryRequest BuildCreateLogEntryRequest(
+        string productionId,
         DateTime? date,
         IEnumerable<string>? tags,
         bool liked)
     {
-        var fields = new List<KeyValuePair<string, string>>
+        return new CreateLogEntryRequest
         {
-            new ("__csrf", csrf),
-            new ("json", "true"),
-            new ("viewingId", string.Empty),
-            new ("viewingableUid", diaryEntryForm.ViewingableUid),
-            new ("viewingDateStr", date?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) ?? string.Empty),
-            new ("review", string.Empty),
-            new ("tags", NormalizeTags(tags)),
-            new ("rating", "0"),
+            ProductionId = productionId,
+            DiaryDetails = date.HasValue
+                ? new DiaryDetailsRequest(
+                    date.Value.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+                    Rewatch: false)
+                : null,
+            Tags = NormalizeTags(tags),
+            Like = liked,
         };
+    }
 
-        if (date.HasValue)
+    internal static FallbackCreateLogEntryRequest BuildFallbackCreateLogEntryRequest(
+        string productionId,
+        DateTime? date,
+        IEnumerable<string>? tags,
+        bool liked)
+    {
+        return new FallbackCreateLogEntryRequest
         {
-            fields.Add(new KeyValuePair<string, string>("specifiedDate", "true"));
-        }
-
-        if (liked)
-        {
-            fields.Add(new KeyValuePair<string, string>("liked", "true"));
-        }
-
-        return fields;
+            FilmId = productionId,
+            DiaryDetails = date.HasValue
+                ? new DiaryDetailsRequest(
+                    date.Value.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+                    Rewatch: false)
+                : null,
+            Tags = NormalizeTags(tags),
+            Like = liked,
+        };
     }
 
     internal static string? ExtractSupermodelCsrf(string html)
@@ -886,30 +888,66 @@ public class LetterboxdApi
             RegexOptions.CultureInvariant);
     }
 
-    private static string NormalizeActionPath(string? actionPath)
+    private static string? TryGetProductionIdFromHeaders(HttpResponseHeaders? headers)
     {
-        if (string.IsNullOrWhiteSpace(actionPath) || actionPath == "#")
+        if (headers == null || !headers.TryGetValues("x-letterboxd-identifier", out var values))
         {
-            return "/s/save-diary-entry";
+            return null;
         }
 
-        if (Uri.TryCreate(actionPath, UriKind.Absolute, out var absoluteUri))
-        {
-            return absoluteUri.PathAndQuery;
-        }
-
-        return actionPath.StartsWith("/", StringComparison.Ordinal)
-            ? actionPath
-            : "/" + actionPath.TrimStart('/');
+        var productionId = values.FirstOrDefault();
+        return string.IsNullOrWhiteSpace(productionId) ? null : productionId;
     }
 
-    private static string NormalizeTags(IEnumerable<string>? tags)
+    private static string TryExtractApiMessage(string body)
     {
-        return string.Join(
-            ",",
-            (tags ?? Array.Empty<string>())
-                .Where(static tag => !string.IsNullOrWhiteSpace(tag))
-                .Select(static tag => tag.Trim()));
+        if (string.IsNullOrWhiteSpace(body))
+        {
+            return "Unknown API error";
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(body);
+            var root = document.RootElement;
+            if (root.TryGetProperty("message", out var messageElement) &&
+                messageElement.ValueKind == JsonValueKind.String)
+            {
+                return messageElement.GetString() ?? "Unknown API error";
+            }
+        }
+        catch (JsonException)
+        {
+        }
+
+        return "Unknown API error";
+    }
+
+    private async Task<ApiSubmissionResponse> SubmitLogEntryAsync(Uri endpoint, string filmSlug, string requestJson)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
+        request.Headers.Referrer = new Uri($"https://letterboxd.com/film/{filmSlug}/");
+        request.Headers.TryAddWithoutValidation("Origin", "https://letterboxd.com");
+        request.Headers.TryAddWithoutValidation("sec-fetch-dest", "empty");
+        request.Headers.TryAddWithoutValidation("sec-fetch-mode", "cors");
+        request.Headers.TryAddWithoutValidation("sec-fetch-site", "same-site");
+        request.Headers.Remove("sec-fetch-user");
+        request.Headers.Remove("upgrade-insecure-requests");
+        request.Headers.Accept.Clear();
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        request.Content = new StringContent(requestJson, Encoding.UTF8, "application/json");
+
+        using var response = await client.SendAsync(request).ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+        return new ApiSubmissionResponse(response.StatusCode, body, endpoint.AbsolutePath);
+    }
+
+    private static string[] NormalizeTags(IEnumerable<string>? tags)
+    {
+        return (tags ?? Array.Empty<string>())
+            .Where(static tag => !string.IsNullOrWhiteSpace(tag))
+            .Select(static tag => tag.Trim())
+            .ToArray();
     }
 }
 
@@ -917,10 +955,17 @@ public class FilmResult
 {
     public string filmSlug = string.Empty;
     public string filmId = string.Empty;
+    public string productionId = string.Empty;
 
     public FilmResult(string filmSlug, string filmId)
+        : this(filmSlug, filmId, string.Empty)
+    {
+    }
+
+    public FilmResult(string filmSlug, string filmId, string productionId)
     {
         this.filmSlug = filmSlug;
         this.filmId = filmId;
+        this.productionId = productionId;
     }
 }
