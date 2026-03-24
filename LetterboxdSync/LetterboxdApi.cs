@@ -28,6 +28,7 @@ public class LetterboxdApi
     private readonly HttpClient client;
 
     private static readonly Uri BaseUri = new Uri("https://letterboxd.com/");
+    internal sealed record DiaryEntryFormDetails(string ActionPath, string ViewingableUid);
 
     private bool HasCookie(string name)
     {
@@ -83,22 +84,6 @@ public class LetterboxdApi
         }
     }
 
-    private async Task RefreshCsrfFromFilmPageAsync(string filmSlug)
-    {
-        // Film page typically contains the CSRF token expected by actions related to that film.
-        using var request = new HttpRequestMessage(HttpMethod.Get, $"/film/{filmSlug}/");
-        SetNavigationHeaders(request.Headers, "same-origin");
-        using var response = await client.SendAsync(request).ConfigureAwait(false);
-        var html = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-
-        var fresh = ExtractHiddenInput(html, "__csrf");
-        if (string.IsNullOrWhiteSpace(fresh))
-            throw new Exception($"Could not extract __csrf from film page /film/{filmSlug}/");
-
-        this.csrf = fresh!;
-    }
-
-
     private string GetCsrfFromCookie()
     {
         var cookies = cookieContainer.GetCookies(new Uri("https://letterboxd.com/"));
@@ -119,6 +104,54 @@ public class LetterboxdApi
         if (string.IsNullOrWhiteSpace(token))
             throw new Exception("Could not read CSRF cookie 'com.xk72.webparts.csrf' after refreshing.");
         this.csrf = token;
+    }
+
+    private async Task<bool> IsLoggedInAsync()
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, "/");
+        SetNavigationHeaders(request.Headers);
+        using var response = await client.SendAsync(request).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+        {
+            return false;
+        }
+
+        var html = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+
+        var pageCsrf = ExtractSupermodelCsrf(html);
+        if (!string.IsNullOrWhiteSpace(pageCsrf))
+        {
+            this.csrf = pageCsrf;
+        }
+
+        return IsLoggedInHtml(html);
+    }
+
+    private async Task<DiaryEntryFormDetails> GetDiaryEntryFormDetailsAsync(string filmSlug, string filmId)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, $"/film/{filmSlug}/");
+        SetNavigationHeaders(request.Headers, "same-origin");
+        using var response = await client.SendAsync(request).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+        {
+            var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            if (body.Length > 300)
+            {
+                body = body.Substring(0, 300);
+            }
+
+            throw new Exception(
+                $"Film page lookup returned {(int)response.StatusCode} for https://letterboxd.com/film/{filmSlug}/. Body: " + body);
+        }
+
+        var html = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+        var pageCsrf = ExtractSupermodelCsrf(html);
+        if (!string.IsNullOrWhiteSpace(pageCsrf))
+        {
+            this.csrf = pageCsrf;
+        }
+
+        return ParseDiaryEntryForm(html, filmSlug, filmId);
     }
 
     public LetterboxdApi(ILogger? logger = null)
@@ -201,11 +234,14 @@ public class LetterboxdApi
             try
             {
                 await RefreshCsrfCookieAsync().ConfigureAwait(false);
-                return;
+                if (await IsLoggedInAsync().ConfigureAwait(false))
+                {
+                    return;
+                }
             }
             catch
             {
-                // If refreshing CSRF fails (e.g. cookies expired), proceed to normal login.
+                // If the injected session is expired, proceed to the normal login flow.
             }
         }
 
@@ -362,6 +398,12 @@ public class LetterboxdApi
         {
             // Keep the sign-in csrf if this fails.
         }
+
+        if (!await IsLoggedInAsync().ConfigureAwait(false))
+        {
+            throw new Exception(
+                "Letterboxd authentication did not establish a logged-in session. Refresh your raw cookies or sign in again.");
+        }
     }
 
     public async Task<FilmResult> SearchFilmByTmdbId(int tmdbid)
@@ -473,15 +515,12 @@ public class LetterboxdApi
 
     public async Task MarkAsWatched(string filmSlug, string filmId, DateTime? date, string[] tags, bool liked = false)
     {
-        string url = "/s/save-diary-entry";
-        DateTime viewingDate = date == null ? DateTime.Now : (DateTime)date;
-
         for (int attempt = 0; attempt < 3; attempt++)
         {
-            // IMPORTANT: Refresh CSRF from the film page (scoped token).
             await RefreshCsrfCookieAsync().ConfigureAwait(false);
+            var diaryEntryForm = await GetDiaryEntryFormDetailsAsync(filmSlug, filmId).ConfigureAwait(false);
 
-            using (var request = new HttpRequestMessage(HttpMethod.Post, url))
+            using (var request = new HttpRequestMessage(HttpMethod.Post, diaryEntryForm.ActionPath))
             {
                 // Make the request look like the browser flow for this action
                 request.Headers.Referrer = new Uri($"https://letterboxd.com/film/{filmSlug}/");
@@ -497,19 +536,8 @@ public class LetterboxdApi
                 request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/javascript"));
                 request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("*/*", 0.01));
 
-                request.Content = new FormUrlEncodedContent(new Dictionary<string, string>
-                {
-                    { "__csrf", this.csrf },
-                    { "json", "true" },
-                    { "viewingId", string.Empty },
-                    { "filmId", filmId },
-                    { "specifiedDate", date == null ? "false" : "true" },
-                    { "viewingDateStr", viewingDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) },
-                    { "review", string.Empty },
-                    { "tags", date != null && tags.Length > 0 ? $"[{string.Join(",", tags)}]" : string.Empty },
-                    { "rating", "0" },
-                    { "liked", liked.ToString().ToLowerInvariant() } // some endpoints are picky about casing
-                });
+                request.Content = new FormUrlEncodedContent(
+                    BuildDiaryEntryRequestForm(this.csrf, diaryEntryForm, date, tags, liked));
 
                 using (var response = await client.SendAsync(request).ConfigureAwait(false))
                 {
@@ -524,7 +552,8 @@ public class LetterboxdApi
                     }
                     if (response.StatusCode != HttpStatusCode.OK)
                     {
-                        throw new Exception($"Letterboxd returned {(int)response.StatusCode}. Body: " + bodyPreview);
+                        throw new Exception(
+                            $"Letterboxd returned {(int)response.StatusCode} from {diaryEntryForm.ActionPath}. Body: " + bodyPreview);
                     }
 
                     using (JsonDocument doc = JsonDocument.Parse(body))
@@ -789,6 +818,107 @@ public class LetterboxdApi
         var pattern = $@"<input[^>]*\bname\s*=\s*[""']{Regex.Escape(name)}[""'][^>]*\bvalue\s*=\s*[""']([^""']*)[""'][^>]*>";
         var m = Regex.Match(html, pattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
         return m.Success ? WebUtility.HtmlDecode(m.Groups[1].Value) : null;
+    }
+
+    internal static DiaryEntryFormDetails ParseDiaryEntryForm(string html, string filmSlug, string filmId)
+    {
+        var htmlDoc = new HtmlDocument();
+        htmlDoc.LoadHtml(html);
+
+        var form = htmlDoc.DocumentNode.SelectSingleNode(
+                       "//form[contains(concat(' ', normalize-space(@class), ' '), ' js-diary-entry-form ')]") ??
+                   htmlDoc.DocumentNode.SelectSingleNode("//form[starts-with(@id, 'diary-entry-form-')]");
+
+        var actionPath = NormalizeActionPath(form?.GetAttributeValue("action", string.Empty));
+        var viewingableUid = form?.SelectSingleNode(".//input[@name='viewingableUid']")
+            ?.GetAttributeValue("value", string.Empty) ?? string.Empty;
+
+        if (string.IsNullOrWhiteSpace(viewingableUid) && !string.IsNullOrWhiteSpace(filmId))
+        {
+            viewingableUid = $"film:{filmId}";
+        }
+
+        if (string.IsNullOrWhiteSpace(viewingableUid))
+        {
+            throw new Exception($"Could not resolve viewingableUid from /film/{filmSlug}/ diary form.");
+        }
+
+        return new DiaryEntryFormDetails(actionPath, viewingableUid);
+    }
+
+    internal static IReadOnlyList<KeyValuePair<string, string>> BuildDiaryEntryRequestForm(
+        string csrf,
+        DiaryEntryFormDetails diaryEntryForm,
+        DateTime? date,
+        IEnumerable<string>? tags,
+        bool liked)
+    {
+        var fields = new List<KeyValuePair<string, string>>
+        {
+            new ("__csrf", csrf),
+            new ("json", "true"),
+            new ("viewingId", string.Empty),
+            new ("viewingableUid", diaryEntryForm.ViewingableUid),
+            new ("viewingDateStr", date?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) ?? string.Empty),
+            new ("review", string.Empty),
+            new ("tags", NormalizeTags(tags)),
+            new ("rating", "0"),
+        };
+
+        if (date.HasValue)
+        {
+            fields.Add(new KeyValuePair<string, string>("specifiedDate", "true"));
+        }
+
+        if (liked)
+        {
+            fields.Add(new KeyValuePair<string, string>("liked", "true"));
+        }
+
+        return fields;
+    }
+
+    internal static string? ExtractSupermodelCsrf(string html)
+    {
+        var m = Regex.Match(
+            html,
+            @"supermodelCSRF\s*=\s*[""']([^""']+)[""']",
+            RegexOptions.CultureInvariant);
+        return m.Success ? WebUtility.HtmlDecode(m.Groups[1].Value) : null;
+    }
+
+    internal static bool IsLoggedInHtml(string html)
+    {
+        return Regex.IsMatch(
+            html,
+            @"\bloggedIn\s*:\s*true\b",
+            RegexOptions.CultureInvariant);
+    }
+
+    private static string NormalizeActionPath(string? actionPath)
+    {
+        if (string.IsNullOrWhiteSpace(actionPath) || actionPath == "#")
+        {
+            return "/s/save-diary-entry";
+        }
+
+        if (Uri.TryCreate(actionPath, UriKind.Absolute, out var absoluteUri))
+        {
+            return absoluteUri.PathAndQuery;
+        }
+
+        return actionPath.StartsWith("/", StringComparison.Ordinal)
+            ? actionPath
+            : "/" + actionPath.TrimStart('/');
+    }
+
+    private static string NormalizeTags(IEnumerable<string>? tags)
+    {
+        return string.Join(
+            ",",
+            (tags ?? Array.Empty<string>())
+                .Where(static tag => !string.IsNullOrWhiteSpace(tag))
+                .Select(static tag => tag.Trim()));
     }
 }
 
