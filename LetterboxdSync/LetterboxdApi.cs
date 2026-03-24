@@ -234,14 +234,11 @@ public class LetterboxdApi
             try
             {
                 await RefreshCsrfCookieAsync().ConfigureAwait(false);
-                if (await IsLoggedInAsync().ConfigureAwait(false))
-                {
-                    return;
-                }
+                return;
             }
             catch
             {
-                // If the injected session is expired, proceed to the normal login flow.
+                // If refreshing CSRF fails (e.g. cookies expired), proceed to normal login.
             }
         }
 
@@ -397,12 +394,6 @@ public class LetterboxdApi
         catch
         {
             // Keep the sign-in csrf if this fails.
-        }
-
-        if (!await IsLoggedInAsync().ConfigureAwait(false))
-        {
-            throw new Exception(
-                "Letterboxd authentication did not establish a logged-in session. Refresh your raw cookies or sign in again.");
         }
     }
 
