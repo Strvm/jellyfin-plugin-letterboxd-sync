@@ -817,33 +817,29 @@ public class LetterboxdApi
 
         HtmlNode? filmNode =
             htmlDoc.DocumentNode.SelectSingleNode(
-                $"//*[@data-item-slug='{filmSlug}' and @data-film-id and @data-postered-identifier]") ??
+                $"//*[@data-item-slug='{filmSlug}' and @data-postered-identifier]") ??
             htmlDoc.DocumentNode.SelectSingleNode(
-                $"//*[@data-item-link='/film/{filmSlug}/' and @data-film-id and @data-postered-identifier]") ??
-            htmlDoc.DocumentNode.SelectSingleNode("//*[@data-film-id and @data-postered-identifier]");
+                $"//*[@data-item-link='/film/{filmSlug}/' and @data-postered-identifier]") ??
+            htmlDoc.DocumentNode.SelectSingleNode(
+                $"//*[@data-details-endpoint='/film/{filmSlug}/json/' and @data-postered-identifier]");
 
-        if (filmNode == null)
+        ProductionIdentifier? postedIdentifier = null;
+        if (filmNode != null)
         {
-            throw new Exception("The search returned no results (No html element found to get Letterboxd film identifiers)");
+            postedIdentifier = ParseProductionIdentifier(
+                filmNode.GetAttributeValue("data-postered-identifier", string.Empty),
+                filmSlug);
         }
 
-        var postedIdentifier = ParseProductionIdentifier(
-            filmNode.GetAttributeValue("data-postered-identifier", string.Empty),
-            filmSlug);
-
-        var filmId = filmNode.GetAttributeValue("data-film-id", string.Empty);
-        if (string.IsNullOrWhiteSpace(filmId) &&
-            postedIdentifier.Uid.StartsWith("film:", StringComparison.OrdinalIgnoreCase))
-        {
-            filmId = postedIdentifier.Uid["film:".Length..];
-        }
+        var filmId = filmNode?.GetAttributeValue("data-film-id", string.Empty) ?? string.Empty;
+        filmId = ResolveFilmId(filmId, postedIdentifier?.Uid, ExtractViewingableUid(html));
 
         if (string.IsNullOrWhiteSpace(filmId))
         {
-            throw new Exception("The search returned no results (data-film-id attribute is empty)");
+            throw new Exception("The search returned no results (Could not resolve Letterboxd film UID)");
         }
 
-        var productionId = TryGetProductionIdFromHeaders(headers) ?? postedIdentifier.Lid;
+        var productionId = TryGetProductionIdFromHeaders(headers) ?? postedIdentifier?.Lid;
         if (string.IsNullOrWhiteSpace(productionId))
         {
             throw new Exception($"Could not resolve Letterboxd productionId from /film/{filmSlug}/.");
@@ -919,6 +915,27 @@ public class LetterboxdApi
         return m.Success ? WebUtility.HtmlDecode(m.Groups[1].Value) : null;
     }
 
+    internal static string? ExtractViewingableUid(string html)
+    {
+        foreach (var pattern in new[]
+        {
+            @"\bdata\.viewingable\.uid\s*=\s*[""']([^""']+)[""']",
+            @"\bdata-production-uid\s*=\s*[""']([^""']+)[""']",
+        })
+        {
+            var match = Regex.Match(
+                html,
+                pattern,
+                RegexOptions.CultureInvariant);
+            if (match.Success)
+            {
+                return WebUtility.HtmlDecode(match.Groups[1].Value);
+            }
+        }
+
+        return null;
+    }
+
     internal static bool IsLoggedInHtml(string html)
     {
         return Regex.IsMatch(
@@ -936,6 +953,27 @@ public class LetterboxdApi
 
         var productionId = values.FirstOrDefault();
         return string.IsNullOrWhiteSpace(productionId) ? null : productionId;
+    }
+
+    private static string ResolveFilmId(params string?[] candidates)
+    {
+        foreach (var candidate in candidates)
+        {
+            if (string.IsNullOrWhiteSpace(candidate))
+            {
+                continue;
+            }
+
+            var filmId = candidate.StartsWith("film:", StringComparison.OrdinalIgnoreCase)
+                ? candidate["film:".Length..]
+                : candidate;
+            if (filmId.All(static c => c >= '0' && c <= '9'))
+            {
+                return filmId;
+            }
+        }
+
+        return string.Empty;
     }
 
     private static string TryExtractApiMessage(string body)
