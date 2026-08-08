@@ -620,35 +620,142 @@ public class LetterboxdApi
         using var response = await client.SendAsync(request).ConfigureAwait(false);
         var responseHtml = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
 
-        var htmlDoc = new HtmlDocument();
-        htmlDoc.LoadHtml(responseHtml);
-
-        var monthElements = htmlDoc.DocumentNode.SelectNodes("//a[contains(@class, 'month')]");
-        var dayElements = htmlDoc.DocumentNode.SelectNodes("//a[contains(@class, 'date') or contains(@class, 'daydate')]");
-        var yearElements = htmlDoc.DocumentNode.SelectNodes("//a[contains(@class, 'year')]");
-
-        var lstDates = new List<DateTime>();
-
-        if (monthElements != null && dayElements != null && yearElements != null)
+        if (!response.IsSuccessStatusCode)
         {
-            var minCount = Math.Min(Math.Min(monthElements.Count, dayElements.Count), yearElements.Count);
+            throw new HttpRequestException(
+                $"Letterboxd returned {(int)response.StatusCode} while checking /film/{filmSlug}/ diary history. " +
+                "Diary submission was skipped because duplicate status could not be verified.",
+                null,
+                response.StatusCode);
+        }
 
-            for (int i = 0; i < minCount; i++)
+        var finalPath = response.RequestMessage?.RequestUri?.AbsolutePath ?? string.Empty;
+        if (finalPath.Contains("sign-in", StringComparison.OrdinalIgnoreCase) ||
+            responseHtml.Contains("cf-chl-", StringComparison.OrdinalIgnoreCase) ||
+            responseHtml.Contains("Just a moment", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"Letterboxd did not return diary history for /film/{filmSlug}/. " +
+                "Diary submission was skipped because authentication or anti-bot protection interrupted the lookup.");
+        }
+
+        var dates = ParseDiaryDates(responseHtml);
+        return dates.Count > 0 ? dates.Max() : null;
+    }
+
+    internal static IReadOnlyList<DateTime> ParseDiaryDates(string html)
+    {
+        var htmlDoc = new HtmlDocument();
+        htmlDoc.LoadHtml(html);
+        var dates = new HashSet<DateTime>();
+
+        var datedNodes = htmlDoc.DocumentNode.SelectNodes(
+            "//*[@data-viewing-date] | " +
+            "//*[contains(concat(' ', normalize-space(@class), ' '), ' diary-entry-row ')]" +
+            "//*[@datetime or (@itemprop='datePublished' and @content)] | " +
+            "//*[contains(concat(' ', normalize-space(@class), ' '), ' film-viewing-info-wrapper ')]" +
+            "//*[@datetime or (@itemprop='datePublished' and @content)]");
+        if (datedNodes != null)
+        {
+            foreach (var node in datedNodes)
             {
-                var month = monthElements[i].InnerText?.Trim();
-                var day = dayElements[i].InnerText?.Trim();
-                var year = yearElements[i].InnerText?.Trim();
+                AddDiaryDate(
+                    dates,
+                    node.GetAttributeValue("data-viewing-date", string.Empty),
+                    node.GetAttributeValue("datetime", string.Empty),
+                    node.GetAttributeValue("content", string.Empty));
+            }
+        }
 
-                if (!string.IsNullOrEmpty(month) && !string.IsNullOrEmpty(day) && !string.IsNullOrEmpty(year))
+        var links = htmlDoc.DocumentNode.SelectNodes("//a[@href]");
+        if (links != null)
+        {
+            foreach (var link in links)
+            {
+                var match = Regex.Match(
+                    link.GetAttributeValue("href", string.Empty),
+                    @"/diary/(?:for/)?(?<year>\d{4})/(?<month>\d{1,2})/(?<day>\d{1,2})(?:/|$)",
+                    RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+                if (match.Success &&
+                    int.TryParse(match.Groups["year"].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var year) &&
+                    int.TryParse(match.Groups["month"].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var month) &&
+                    int.TryParse(match.Groups["day"].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var day) &&
+                    TryCreateDate(year, month, day, out var parsedDate))
                 {
-                    var dateString = $"{day} {month} {year}";
-                    if (DateTime.TryParse(dateString, out DateTime parsedDate))
-                        lstDates.Add(parsedDate);
+                    dates.Add(parsedDate);
                 }
             }
         }
 
-        return lstDates.Count > 0 ? lstDates.Max() : null;
+        var monthElements = htmlDoc.DocumentNode.SelectNodes(
+            "//*[contains(concat(' ', normalize-space(@class), ' '), ' month ')]");
+        var dayElements = htmlDoc.DocumentNode.SelectNodes(
+            "//*[contains(concat(' ', normalize-space(@class), ' '), ' daydate ') or " +
+            "contains(concat(' ', normalize-space(@class), ' '), ' date ')]");
+        var yearElements = htmlDoc.DocumentNode.SelectNodes(
+            "//*[contains(concat(' ', normalize-space(@class), ' '), ' year ')]");
+
+        if (monthElements != null && dayElements != null && yearElements != null)
+        {
+            var count = Math.Min(Math.Min(monthElements.Count, dayElements.Count), yearElements.Count);
+            for (var i = 0; i < count; i++)
+            {
+                AddDiaryDate(
+                    dates,
+                    $"{dayElements[i].InnerText?.Trim()} {monthElements[i].InnerText?.Trim()} {yearElements[i].InnerText?.Trim()}");
+            }
+        }
+
+        return dates.OrderBy(static date => date).ToArray();
+    }
+
+    private static void AddDiaryDate(HashSet<DateTime> dates, params string?[] candidates)
+    {
+        string[] formats = ["d MMM yyyy", "dd MMM yyyy"];
+        foreach (var candidate in candidates)
+        {
+            if (string.IsNullOrWhiteSpace(candidate))
+            {
+                continue;
+            }
+
+            var decoded = WebUtility.HtmlDecode(candidate).Trim();
+            if (decoded.Length >= 10 &&
+                DateTime.TryParseExact(
+                    decoded[..10],
+                    "yyyy-MM-dd",
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.None,
+                    out var machineDate))
+            {
+                dates.Add(machineDate);
+                continue;
+            }
+
+            if (DateTime.TryParseExact(
+                    decoded,
+                    formats,
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.AllowWhiteSpaces,
+                    out var parsedDate))
+            {
+                dates.Add(parsedDate.Date);
+            }
+        }
+    }
+
+    private static bool TryCreateDate(int year, int month, int day, out DateTime date)
+    {
+        try
+        {
+            date = new DateTime(year, month, day);
+            return true;
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            date = default;
+            return false;
+        }
     }
 
     /// <summary>

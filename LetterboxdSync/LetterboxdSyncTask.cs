@@ -116,7 +116,7 @@ public class LetterboxdSyncTask : IScheduledTask
                         var dateLastLog = await api.GetDateLastLog(filmResult.filmSlug).ConfigureAwait(false);
                         viewingDate = new DateTime(viewingDate.Value.Year, viewingDate.Value.Month, viewingDate.Value.Day);
 
-                        if (dateLastLog != null && dateLastLog.Value.Date == viewingDate.Value.Date)
+                        if (!ShouldSyncViewing(dateLastLog, viewingDate.Value))
                         {
                             _logger.LogWarning(
                                 @"Film has been logged into Letterboxd previously ({Date})
@@ -164,6 +164,11 @@ public class LetterboxdSyncTask : IScheduledTask
         }
 
         progress.Report(100);
+    }
+
+    internal static bool ShouldSyncViewing(DateTime? latestLetterboxdDate, DateTime jellyfinViewingDate)
+    {
+        return !latestLetterboxdDate.HasValue || latestLetterboxdDate.Value.Date < jellyfinViewingDate.Date;
     }
 
     public IEnumerable<TaskTriggerInfo> GetDefaultTriggers() => new[]
