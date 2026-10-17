@@ -47,7 +47,7 @@ public class LetterboxdSyncTask : IScheduledTask
 
     public async Task ExecuteAsync(IProgress<double> progress, CancellationToken cancellationToken)
     {
-        var lstUsers = _userManager.Users;
+        var lstUsers = UserManagerCompat.GetUsers(_userManager);
         foreach (var user in lstUsers)
         {
             var account = Configuration.Accounts.FirstOrDefault(account => account.UserJellyfin == user.Id.ToString("N") && account.Enable);

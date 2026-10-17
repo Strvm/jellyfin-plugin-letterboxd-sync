@@ -49,7 +49,7 @@ public class LetterboxdWatchlistSyncTask : IScheduledTask
 
     public async Task ExecuteAsync(IProgress<double> progress, CancellationToken cancellationToken)
     {
-        var users = _userManager.Users.ToList();
+        var users = UserManagerCompat.GetUsers(_userManager).ToList();
         var totalUsers = users.Count;
         var processedUsers = 0;
 
@@ -186,7 +186,8 @@ public class LetterboxdWatchlistSyncTask : IScheduledTask
             return;
         }
 
-        await _playlistManager.AddItemToPlaylistAsync(
+        await PlaylistManagerCompat.AddItemToPlaylistAsync(
+            _playlistManager,
             playlist.Id,
             itemsToAdd.AsReadOnly(),
             jellyfinUserId).ConfigureAwait(false);

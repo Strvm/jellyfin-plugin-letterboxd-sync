@@ -328,7 +328,7 @@ public class LetterboxdApi
                         }
 
                         var retryHtml = await retryRes.Content.ReadAsStringAsync().ConfigureAwait(false);
-                        var csrfFromRetry = ExtractHiddenInput(retryHtml, "__csrf");
+                        var csrfFromRetry = ExtractSignInCsrf(retryHtml);
                         if (string.IsNullOrWhiteSpace(csrfFromRetry))
                             throw new Exception("Could not find __csrf token on /sign-in/ after retry.");
                         this.csrf = csrfFromRetry;
@@ -350,7 +350,7 @@ public class LetterboxdApi
                 }
 
                 var signInHtml = await signInResponse.Content.ReadAsStringAsync().ConfigureAwait(false);
-                var csrfFromSignIn = ExtractHiddenInput(signInHtml, "__csrf");
+                var csrfFromSignIn = ExtractSignInCsrf(signInHtml);
                 if (string.IsNullOrWhiteSpace(csrfFromSignIn))
                 {
                     throw new Exception("Could not find __csrf token on /sign-in/ (login flow likely changed).");
@@ -1011,6 +1011,13 @@ public class LetterboxdApi
             Tags = NormalizeTags(tags),
             Like = liked,
         };
+    }
+
+    internal static string? ExtractSignInCsrf(string html)
+    {
+        // Older sign-in pages carried a hidden __csrf input; current ones only set it in the supermodelCSRF script variable.
+        var csrf = ExtractHiddenInput(html, "__csrf");
+        return string.IsNullOrWhiteSpace(csrf) ? ExtractSupermodelCsrf(html) : csrf;
     }
 
     internal static string? ExtractSupermodelCsrf(string html)
